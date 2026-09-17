@@ -1,0 +1,45 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell-and-secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Shellcheck all scripts
+        run: |
+          shopt -s globstar
+          shellcheck -x scripts/*.sh litellm/*.sh || exit 1
+
+      - name: Bash syntax check
+        run: |
+          for f in scripts/*.sh litellm/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Ensure no cluster.env committed
+        run: |
+          if git ls-files | grep -E '(^|/)cluster\.env$|(^|/)\.env$'; then
+            echo "Committed env file with potential secrets"; exit 1
+          fi
+
+      - name: Reject placeholder secrets outside examples
+        run: |
+          if git grep -nE 'hf_REPLACE_ME|VLLM_API_KEY=REPLACE_ME' -- \
+              ':!*.example' ':!README.md' ':!.github/**'; then
+            echo "Placeholder secret found outside example files"; exit 1
+          fi
+
+      - name: Fail on obvious hardcoded secrets
+        run: |
+          if git grep -nE 'hf_[A-Za-z0-9]{20,}' -- ':!*.example'; then
+            echo "Possible Hugging Face token committed"; exit 1
+          fi

@@ -1,0 +1,28 @@
+# Merge this entry into your existing LiteLLM config.yaml.
+#
+# On the LiteLLM host, set:
+#   export QWEN_VLLM_API_BASE=http://<SPARK_1_LAN_IP>:8000/v1
+#   export QWEN_VLLM_API_KEY='<same VLLM_API_KEY as Spark 1>'
+#
+# Client-facing alias:   qwen3-235b
+# Upstream served-model: qwen3-235b-a22b  (must match vLLM --served-model-name)
+
+model_list:
+  - model_name: qwen3-235b
+    litellm_params:
+      model: hosted_vllm/qwen3-235b-a22b
+      api_base: os.environ/QWEN_VLLM_API_BASE
+      api_key: os.environ/QWEN_VLLM_API_KEY
+      timeout: 600
+      stream_timeout: 600
+      max_retries: 1
+    model_info:
+      mode: chat
+      # Reserve headroom for output tokens inside MAX_MODEL_LEN=4096
+      max_input_tokens: 3584
+      max_output_tokens: 512
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+  num_retries: 1

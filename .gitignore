@@ -1,0 +1,30 @@
+# Secrets and local configuration
+config/cluster.env
+cluster.env
+*.env
+!*.env.example
+.env
+.env.*
+!.env.example
+
+# Local artifacts
+logs/
+*.log
+run_cluster.sh
+setup-nccl.sh
+launch-nccl.sh
+vllm-image-digest.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model caches (must never be committed)
+huggingface/
+.cache/
+models/
