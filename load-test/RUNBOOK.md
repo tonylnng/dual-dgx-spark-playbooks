@@ -1418,7 +1418,44 @@ deploy/load-test.sh bench --duration 60                            # sustained: 
 deploy/load-test.sh bench --levels 4 --requests 40 --ignore-eos    # steady-state decode, no early stops
 deploy/load-test.sh bench --no-cache-bust --levels 1,8             # measure the prefix cache instead of beating it
 LEVELS=1,2,4 deploy/load-test.sh bench                             # ladder from the environment
+deploy/load-test.sh bench --prompt-file loadtest/samples/question.example.txt   # one question, verbatim
+deploy/load-test.sh bench --prompts loadtest/samples/prompts.example.jsonl --levels 1,4,8  # real corpus
 ```
+
+**Tailoring the question.** The default prompt is deliberately meaningless filler —
+random words from a fixed 40-word vocabulary, seed `0xC0FFEE`, plus a `Summarise the
+passage…` tail — because prefill cost and KV pressure track prompt *length*, not
+meaning. Each request gets a `[req <16 hex>]` nonce: prefix caching is ON, so a
+repeated prompt is a cache hit rather than a load test. Two things to know before
+trusting the label: `--input-tokens` is a word-count heuristic, so the default
+"128 tok" **measures 184–185 prompt tokens** once the nonce, tail and chat template
+are counted; and `--max-tokens` usually binds (measured `finish_reason=length` on
+every request), so output length is a setting, not an observation.
+
+Bring your own content when the workload matters more than the shape:
+
+```bash
+--prompt-file loadtest/samples/question.example.txt   # sent verbatim every request
+--prompts     loadtest/samples/prompts.example.jsonl  # JSONL corpus, round-robin
+```
+
+`--prompts` takes one request per line — `{"messages": [...]}`, `{"prompt": "…"}`,
+aliases `input`/`text`/`content`, or a bare JSON string. It fails on the line number
+rather than guessing, so a truncated export is caught before the ladder starts. The
+nonce goes in the **last** user turn, not the first: prefixing the first turn would
+destroy the system prompt a real client *does* reuse, so any shared corpus head
+shows up as a partial `prefix hit` in the engine table instead of being assumed away.
+
+Content is not cosmetic — the same pair measured **68–70 % MTP acceptance on filler**
+versus **58–62 % on real questions**, and a real question ends when it wants to, so
+`--max-tokens` stops binding. That is exactly why non-synthetic levels print the
+shape that produced the numbers:
+
+```
+   shape: in 115 tok p50 (100-170), out 96 p50 (96 max)  finish={'length': 5}
+```
+
+Compare levels by that line before concluding a config change made anything faster.
 
 **For a genuinely cold load number**, in this order — the tool deliberately will not
 do the restart for you:
@@ -1487,9 +1524,9 @@ pathological at ~20 minutes of them, once per minute.
 
 ### 20.3 `bench` — what the pair can serve
 
-Closed-loop ladder, streaming, ~128 prompt tokens in / 128 out, **cache-busted
-prompts** (prefix caching is on, so a repeated prompt measures the cache, not the
-model). Measured 2026-09-23, MTP 4 speculative tokens:
+Closed-loop ladder, streaming, synthetic filler prompts measured at **184–185
+tokens in** / 128 out with the cache-busting nonce ([§20.1](#201-how-to-run) covers
+tailoring the content). Measured 2026-09-23, MTP 4 speculative tokens:
 
 | conc | out tok/s | TTFT p50 | TTFT p99 | TPOT p50 | E2E p99 | peak KV | preemptions |
 |---|---|---|---|---|---|---|---|
