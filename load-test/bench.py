@@ -44,7 +44,9 @@ import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-# Small fixed vocabulary: prompt length is what matters here, not its content.
+# Small fixed vocabulary: for the synthetic default, prompt *length* is what drives
+# prefill cost and KV pressure -- meaning does not -- so the words are deliberate
+# filler. Bring your own content with --prompt-file or --prompts.
 WORDS = (
     "the plan records every transfer between the two storage nodes and the "
     "cluster keeps a ledger of each shard revision while operators review the "
@@ -55,16 +57,137 @@ TAIL = "\n\nSummarise the passage above in one short line. Do not reason out lou
 MAX_SEQS_HINT = 8  # MAX_NUM_SEQS in dual.env; above this the scheduler queues
 
 
-# --- prompt construction ------------------------------------------------------
-def build_prompt(tokens: int, bust: bool) -> str:
-    """~`tokens` prompt tokens. 0.75 words/token is close enough for English."""
+def build_prompt(tokens: int) -> str:
+    """~`tokens` prompt tokens of filler. 0.75 words/token is close enough for English."""
     n_words = max(4, int(tokens * 0.75))
     rng = random.Random(0xC0FFEE)  # stable body, so only the nonce varies
-    body = " ".join(rng.choice(WORDS) for _ in range(n_words))
-    # A trailing nonce survives the chat template but can still land in the
-    # tail the prefix cache reuses; a leading one cannot. 16 hex chars ~= 9 tok.
-    head = f"[req {uuid.uuid4().hex[:16]}]\n" if bust else ""
-    return head + body + TAIL
+    return " ".join(rng.choice(WORDS) for _ in range(n_words)) + TAIL
+
+
+class PromptSource:
+    """Where each request's content comes from: filler, one file, or a JSONL corpus.
+
+    Three modes, one interface: next() returns the endpoint-specific half of the
+    request body -- either {"messages": [...]} or {"prompt": "..."} -- so
+    do_request never needs to know which mode is running.
+
+    The nonce is what keeps the measurement honest. Prefix caching is ON, so
+    replaying identical content is a cache hit, not a load test. Its *position*
+    matters:
+
+      raw prompt -> nonce is prepended, the first thing the cache sees, so none of
+                    the body is reusable.
+      messages   -> nonce goes into the last string-content turn. Prefixing the
+                    first turn would blow away the system prompt a real client
+                    does reuse; putting it last leaves partial hits on a shared
+                    corpus head, which is realistic and -- more usefully --
+                    *visible* in the `prefix hit` column instead of assumed away.
+    """
+
+    def __init__(self, args):
+        if args.prompt_file and args.prompts:
+            sys.exit("!! --prompt-file and --prompts are mutually exclusive")
+        if args.input_tokens < 1:
+            sys.exit("!! --input-tokens must be at least 1")
+        self.tokens = args.input_tokens
+        self.bust = not args.no_cache_bust
+        self.mode = "synthetic"
+        self.path = None
+        self.body = None
+        self.records: list[dict] = []
+        if args.prompt_file:
+            try:
+                with open(args.prompt_file, errors="replace") as fh:
+                    text = fh.read().strip()
+            except OSError as exc:
+                sys.exit(f"!! --prompt-file unreadable: {exc}")
+            if not text:
+                sys.exit(f"!! --prompt-file {args.prompt_file} is empty")
+            self.mode, self.path, self.body = "prompt-file", args.prompt_file, text
+        elif args.prompts:
+            self.mode, self.path = "corpus", args.prompts
+            self.records = self._load_jsonl(args.prompts)
+            with_msgs = sum(1 for r in self.records if "messages" in r)
+            if with_msgs and args.endpoint != "chat":
+                sys.exit(f"!! {with_msgs} of {len(self.records)} records carry 'messages', but "
+                         "--endpoint is completions. Use --endpoint chat, or flatten those "
+                         "records to a plain 'prompt' string -- this tool will not invent a "
+                         "chat template and pass it off as yours.")
+        self.lock = threading.Lock()
+        self.i = 0
+
+    @staticmethod
+    def _load_jsonl(path: str) -> list[dict]:
+        """One request per line; tolerates the field names clients actually emit."""
+        out: list[dict] = []
+        with open(path, errors="replace") as fh:
+            for n, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    sys.exit(f"!! {path}:{n}: not JSON ({exc}). --prompts takes JSON Lines -- "
+                             "one request object per line, not one large array.")
+                if isinstance(obj, str):
+                    obj = {"prompt": obj}
+                if not isinstance(obj, dict):
+                    sys.exit(f"!! {path}:{n}: expected a JSON object or a string")
+                if "messages" in obj:
+                    if not isinstance(obj["messages"], list) or not obj["messages"]:
+                        sys.exit(f"!! {path}:{n}: 'messages' must be a non-empty list")
+                    out.append({"messages": obj["messages"]})
+                    continue
+                for alias in ("prompt", "input", "text", "content"):
+                    if isinstance(obj.get(alias), str):
+                        out.append({"prompt": obj[alias]})
+                        break
+                else:
+                    sys.exit(f"!! {path}:{n}: no 'messages' and no string 'prompt' "
+                             "(aliases 'input' / 'text' / 'content' are also accepted)")
+        if not out:
+            sys.exit(f"!! {path}: no requests found")
+        return out
+
+    def _nonce(self) -> str:
+        return f"[req {uuid.uuid4().hex[:16]}]\n"
+
+    def _prefix(self, text: str) -> str:
+        # Leading nonce. A trailing one can fall inside a cached suffix, which is
+        # exactly the false speed-up being avoided.
+        return (self._nonce() if self.bust else "") + text
+
+    def next(self) -> dict:
+        if self.mode == "synthetic":
+            return {"prompt": self._prefix(build_prompt(self.tokens))}
+        if self.mode == "prompt-file":
+            return {"prompt": self._prefix(self.body)}
+        with self.lock:
+            rec = self.records[self.i % len(self.records)]
+            self.i += 1
+        if "prompt" in rec:
+            return {"prompt": self._prefix(rec["prompt"])}
+        msgs = [dict(m) for m in rec["messages"]]  # copy: never mutate the corpus
+        if self.bust:
+            for m in reversed(msgs):
+                if isinstance(m.get("content"), str):
+                    m["content"] = self._nonce() + m["content"]
+                    break
+        return {"messages": msgs}
+
+    def describe(self) -> dict:
+        return {"mode": self.mode, "source": self.path, "records": len(self.records) or None}
+
+    def note(self) -> str:
+        if self.mode == "synthetic":
+            return (f"synthetic filler ~{self.tokens} tok in "
+                    f"({'cache-busted' if self.bust else 'shared'} prompts)")
+        if self.mode == "prompt-file":
+            return (f"{self.path} verbatim, {len(self.body):,} chars "
+                    f"({'nonce prepended' if self.bust else 'as-is'})")
+        return (f"{len(self.records)} records from {self.path}, round-robin "
+                f"({'nonce in last user turn' if self.bust else 'no nonce'})")
 
 
 # --- HTTP ---------------------------------------------------------------------
@@ -126,16 +249,22 @@ def get_text(target: Target, api: str, key: str) -> str:
 
 
 # --- one request --------------------------------------------------------------
-def do_request(target: Target, args, prompt: str) -> dict:
+def do_request(target: Target, args, payload: dict) -> dict:
     """One completion round trip. Never raises: a failed request is a data point."""
     body = {"model": args.model, "max_tokens": args.max_tokens,
             "temperature": args.temperature, "stream": args.stream}
     if args.ignore_eos:
         body["ignore_eos"] = True  # vLLM-specific extra param; keeps decode comparable
-    if args.endpoint == "chat":
-        body["messages"] = [{"role": "user", "content": prompt}]
+    # The endpoint-specific half comes from PromptSource, already nonce'd.
+    if "messages" in payload:
+        body["messages"] = payload["messages"]
+    elif args.endpoint == "chat":
+        # A raw prompt against the chat endpoint becomes a single user turn. That is
+        # what the synthetic default has always sent, and what a corpus of bare
+        # prompts means under --endpoint chat.
+        body["messages"] = [{"role": "user", "content": payload["prompt"]}]
     else:
-        body["prompt"] = prompt
+        body["prompt"] = payload["prompt"]
     if args.stream:
         # Without include_usage the stream reports no usage and the output count
         # silently falls back to "count SSE chunks", which over-counts every
@@ -351,13 +480,21 @@ def pct_ms(values: list, p: float) -> float | None:
     return None if v is None else 1000 * v
 
 
+def _spread(values: list) -> dict:
+    """min / median / p90 / max, for token counts where a mean hides the tail."""
+    if not values:
+        return {"min": None, "p50": None, "p90": None, "max": None}
+    return {"min": min(values), "p50": pct(values, 50), "p90": pct(values, 90),
+            "max": max(values)}
+
+
 def fmt(v, spec=".2f", unit=""):
     if not isinstance(v, (int, float)) or v != v:
         return "-"
     return format(v, spec) + unit
 
 
-def run_level(target: Target, args, conc: int, n_requests: int) -> dict:
+def run_level(target: Target, args, conc: int, n_requests: int, source: PromptSource) -> dict:
     samples: list[dict] = []
     lock = threading.Lock()
     counter = itertools.count()
@@ -371,8 +508,9 @@ def run_level(target: Target, args, conc: int, n_requests: int) -> dict:
                         return
                 elif next(counter) >= n_requests:
                     return
-            prompt = build_prompt(args.input_tokens, not args.no_cache_bust)
-            samples.append(do_request(target, args, prompt))
+            # A fresh payload per request: the nonce has to differ, and a corpus
+            # advances one record per request rather than per level.
+            samples.append(do_request(target, args, source.next()))
 
     sampler = EngineSampler(target, args.api_key, args.metric_interval)
     before = sampler.snapshot()
@@ -387,6 +525,7 @@ def run_level(target: Target, args, conc: int, n_requests: int) -> dict:
     after = sampler.snapshot()
     return {"concurrency": conc, "wall_s": wall, "samples": samples,
             "before": before, "after": after, "peak": dict(sampler.peak),
+            "prompt": source.describe(),
             "sampler_errors": sampler.errors, "sampler_polls": sampler.polls}
 
 
@@ -423,6 +562,12 @@ def level_row(res: dict) -> dict:
                     "p99": pct_ms([s["tpot"] for s in ok], 99)},
         "e2e_s": {"p50": pct([s["e2e"] for s in ok], 50), "p90": pct([s["e2e"] for s in ok], 90),
                   "p99": pct([s["e2e"] for s in ok], 99)},
+        # Token histograms matter once the prompt is real content: with a corpus,
+        # "the server got slower" and "the corpus happened to be longer this time"
+        # look identical without them.
+        "in_tokens_p": _spread([s["in_tokens"] for s in ok if s["in_tokens"]]),
+        "out_tokens_p": _spread([s["out_tokens"] for s in ok]),
+        "prompt": res.get("prompt"),
         "engine": eng,
         "warnings": [],
     }
@@ -523,7 +668,16 @@ def main() -> int:
     ap.add_argument("--duration", type=float, default=0,
                     help="seconds per level instead of a request count (sustained mode)")
     ap.add_argument("--max-tokens", type=int, default=128)
-    ap.add_argument("--input-tokens", type=int, default=128, help="approx prompt size")
+    ap.add_argument("--input-tokens", type=int, default=128,
+                    help="approx prompt size (synthetic mode only; see --prompt-file)")
+    ap.add_argument("--prompt-file", default="", metavar="PATH",
+                    help="use this file's text verbatim as the prompt on every request. The "
+                         "nonce is still prepended unless --no-cache-bust, so it stays a load "
+                         "test rather than a prefix-cache hit. Makes --input-tokens moot.")
+    ap.add_argument("--prompts", default="", metavar="PATH",
+                    help="JSON Lines corpus, one request per line -- {\"messages\": [...]} for "
+                         "chat or {\"prompt\": \"...\"}; served round-robin across the whole "
+                         "ladder. Makes --input-tokens moot.")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--ignore-eos", action="store_true",
                     help="force full max_tokens output so decode is comparable across levels")
@@ -555,6 +709,9 @@ def main() -> int:
     planned = sum(per_level)
 
     target = Target(args.base, args.timeout)
+    # Built before anything else touches the network: a malformed corpus should fail
+    # here, not halfway through the ladder.
+    source = PromptSource(args)
 
     # ---- guards. This pair also serves interactive traffic; do not join unnoticed.
     try:
@@ -579,9 +736,13 @@ def main() -> int:
     print(f">> ladder  {' -> '.join(str(c) for c in levels)}")
     print(f">> load    " + (f"{args.duration:.0f}s per level, closed-loop" if args.duration
                            else f"{', '.join(str(n) for n in per_level)} requests per level"))
-    print(f">> shape   ~{args.input_tokens} tok in, {args.max_tokens} tok out max, "
-          f"{'stream' if args.stream else 'non-stream'}, "
-          f"{'shared' if args.no_cache_bust else 'cache-busted'} prompts, temp={args.temperature}")
+    print(f">> prompts  {source.note()}")
+    print(f">> shape    {'~' + str(args.input_tokens) + ' tok in, ' if source.mode == 'synthetic' else ''}"
+          f"{args.max_tokens} tok out max, {'stream' if args.stream else 'non-stream'}, "
+          f"temp={args.temperature}")
+    if source.mode != "synthetic" and args.input_tokens != 128:
+        print(">> note     --input-tokens is ignored once real content is supplied; "
+              "the measured sizes are in the JSON per level")
     print(f">> engine  {msum(live, 'vllm:num_requests_running'):.0f} running, "
           f"{kv_rest:.1f}% KV at rest")
     if max(levels) > MAX_SEQS_HINT:
@@ -597,7 +758,7 @@ def main() -> int:
     if args.warmup > 0:
         print(f">> warming up ({args.warmup} untimed request{'s' if args.warmup > 1 else ''})")
         for _ in range(args.warmup):
-            s = do_request(target, args, build_prompt(args.input_tokens, not args.no_cache_bust))
+            s = do_request(target, args, source.next())
             if not s["ok"]:
                 sys.exit(f"!! warmup request failed: {s['error']}\n   Not loading -- server is not answering.")
         print(f">> warm ok: TTFT {1000 * s['ttft']:.0f} ms, {s['out_tokens']} tok in {s['e2e']:.2f}s")
@@ -607,12 +768,20 @@ def main() -> int:
     for idx, conc in enumerate(levels):
         mode = f"{args.duration:.0f}s" if args.duration else f"{per_level[idx]} reqs"
         print(f">> level concurrency={conc} ({mode}) ...", flush=True)
-        row = level_row(run_level(target, args, conc, per_level[idx]))
+        row = level_row(run_level(target, args, conc, per_level[idx], source))
         judge(row, args)
         rows.append(row)
         print(f"   ok={row['ok']} err={row['errors']}  out={fmt(row['out_tok_per_s'], '.1f')} tok/s  "
               f"TTFT p50={fmt(row['ttft_ms']['p50'], '.0f')} ms  "
               f"TPOT p50={fmt(row['tpot_ms']['p50'], '.1f')} ms")
+        if source.mode != "synthetic" and row["in_tokens_p"]["p50"] is not None:
+            # Real content varies in length; print the shape that actually produced
+            # these numbers so a slower level is not misread as a regression.
+            i_sp, o_sp = row["in_tokens_p"], row["out_tokens_p"]
+            print(f"   shape: in {fmt(i_sp['p50'], '.0f')} tok p50 "
+                  f"({fmt(i_sp['min'], '.0f')}-{fmt(i_sp['max'], '.0f')}), "
+                  f"out {fmt(o_sp['p50'], '.0f')} p50 ({fmt(o_sp['max'], '.0f')} max)  "
+                  f"finish={row['finish_reasons']}")
         for msg in row["warnings"]:
             print(f"   !! {msg}")
         if row["sent"] == 0:
@@ -651,8 +820,10 @@ def main() -> int:
             "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "label": args.label or None,
             "target": {"base": args.base, "model": args.model, "endpoint": args.endpoint},
+            "prompt": source.describe(),
             "config": {k: getattr(args, k) for k in
-                       ("levels", "requests", "duration", "max_tokens", "input_tokens", "temperature",
+                       ("levels", "requests", "duration", "max_tokens", "input_tokens",
+                        "prompt_file", "prompts", "temperature",
                         "stream", "ignore_eos", "no_cache_bust", "timeout", "ttft_budget_ms",
                         "max_error_ratio")},
             "kv_pct_at_rest": kv_rest,
