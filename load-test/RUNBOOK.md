@@ -1372,29 +1372,89 @@ One entrypoint for the two questions a local model actually gets asked: **how lo
 does it take to load**, and **how much traffic can it serve**. It reads the same
 `dual-spark/dual.env` as `run.sh` / `verify.sh` / `status.sh`.
 
+### 20.1 How to Run
+
+Paths resolve from the script rather than the cwd, so every command below works from
+anywhere in the repo.
+
+> **Before you run anything.** Nothing in the tool stops, restarts or re-creates a
+> container, and nothing writes `drop_caches`. On a GB10 holding 65 GiB of live
+> weights in unified memory, a cache drop is not a neutral act — it is the difference
+> between "the model is slow to answer" and "the GPU context OOMs" (see the
+> `GPU_MEMORY_UTILIZATION` note in `dual.env`). `load` measures the boot **already in
+> the log**; a genuinely cold number requires the restart, which `load --cmd` prints
+> for you to run. `bench`, though, **does** put traffic on the box — and this pair
+> also serves LiteLLM / Claude Code traffic, so look at `deploy/status.sh`
+> first. `bench` refuses to start while requests are in flight; `--force` overrides.
+
+**Start here.**
+
+| command | cost | what it gives you |
+|---|---|---|
+| `deploy/load-test.sh check` | ~40 s, read-only | both ranks, API + model id, auth 401, idle, `MemAvailable`, swap, checkpoints and compile caches on **both** nodes, log retention |
+| `deploy/load-test.sh load --pair` | ~1 min, read-only | boot timeline for rank 0 **and** rank 1, each phase against the §12 baseline |
+| `deploy/load-test.sh bench` | ~1 min, live traffic | 48 requests over a 1 → 2 → 4 → 8 ladder |
+
 ```bash
-deploy/load-test.sh                 # = check
-deploy/load-test.sh check           # preflight: pair, API, auth, memory, caches
-deploy/load-test.sh load [--pair] [--budget 900] [--json out.json]
-deploy/load-test.sh load --watch    # follow a boot you started, live
-deploy/load-test.sh load --cmd      # print the restart, do not run it
-deploy/load-test.sh bench --levels 1,2,4,8 --requests 6 --max-tokens 128
-deploy/load-test.sh all
+deploy/load-test.sh check          # ~40 s. Read-only. Safe any time
+deploy/load-test.sh load --pair    # ~1 min. Read-only. Both ranks
+deploy/load-test.sh bench          # ~1 min. Puts load on the box; refuses if it is busy
 ```
 
-**Non-destructive by construction.** Nothing in it stops, restarts or re-creates a
-container, and nothing writes `drop_caches`. On a GB10 holding 65 GiB of live
-weights in unified memory, a cache drop is not a neutral act — it is the difference
-between "the model is slow to answer" and "the GPU context OOMs" (see the
-`GPU_MEMORY_UTILIZATION` note in `dual.env`). `load` measures the boot **already in
-the log**; a genuinely cold number requires the restart, which `load --cmd` prints
-for you to run.
+Exit codes are meaningful — `0` ok, `1` on a FAIL or a breached `--budget` — so a
+full sweep composes:
 
-`bench` **does** put traffic on the box, so it refuses to start while requests are
-in flight (`--force` overrides). This pair also serves LiteLLM/Claude Code traffic —
-check with `status.sh` first.
+```bash
+deploy/load-test.sh check && deploy/load-test.sh load --pair --budget 900 && deploy/load-test.sh all
+```
 
-### 20.1 `load` — where the boot time went
+**Bench shapes** — flags after `bench` pass straight through (`bench --help` lists them):
+
+```bash
+deploy/load-test.sh bench --levels 1,2,4,8 --max-tokens 128        # default
+deploy/load-test.sh bench --levels 1,4,8,16                        # past MAX_NUM_SEQS=8: queueing is the point
+deploy/load-test.sh bench --input-tokens 8000 --max-tokens 512     # long-context prefill pressure
+deploy/load-test.sh bench --duration 60                            # sustained: 60 s per level, not N requests
+deploy/load-test.sh bench --levels 4 --requests 40 --ignore-eos    # steady-state decode, no early stops
+deploy/load-test.sh bench --no-cache-bust --levels 1,8             # measure the prefix cache instead of beating it
+LEVELS=1,2,4 deploy/load-test.sh bench                             # ladder from the environment
+```
+
+**For a genuinely cold load number**, in this order — the tool deliberately will not
+do the restart for you:
+
+```bash
+deploy/load-test.sh load --cmd                    # prints the procedure, changes nothing
+cd deploy/dual-spark && ./run.sh up               # yours to run: drops caches, worker then head (~12 min)
+cd ../.. && deploy/load-test.sh load --watch --pair   # follow it live, read-only
+```
+
+`--watch` prints milestones as they land and raises the pitfall signatures (§16) only
+once they cross the threshold where they stop being normal: one `No available shared
+memory broadcast block` line during a 9-minute weight load is expected, ten is the
+Pitfall 2 deadlock.
+
+**Remarks.**
+
+* `--pair`, and the worker rows of `check`, need ssh to `$WORKER`; when it is
+  unreachable they degrade to `WARN` / a rank-0-only report, never a false `FAIL`.
+* `check` reports `WARN` for swap in use and for a thin compile cache — both are
+  load-time problems in waiting, but neither blocks a test.
+* Every bench run writes JSON (all counters, per-request percentiles, error samples)
+  to `deploy/loadtest/results/<UTC>-bench.json`; `--no-json` opts out, `--json PATH`
+  relocates.
+* `load --json PATH` writes the machine-readable phase table for a boot.
+
+| subcommand | meaning |
+|---|---|
+| `check` (default) | preflight table |
+| `load [--pair] [--budget N] [--json P]` | boot timeline from the retained log |
+| `load --watch [--stall N]` | live milestone feed from `docker logs -f` |
+| `load --cmd` | print the cold-restart procedure; execute nothing |
+| `bench <bench.py flags>` | traffic ladder; `bench --help` for the full set |
+| `all` | check → load --pair → bench |
+
+### 20.2 `load` — where the boot time went
 
 Measured 2026-09-23 against the container that has been up since 2026-09-22 07:34 UTC:
 
@@ -1425,7 +1485,7 @@ count threshold — a single `No available shared memory broadcast block` line d
 a 9-minute weight load is **normal** (the queue has no reader yet); Pitfall 2 was
 pathological at ~20 minutes of them, once per minute.
 
-### 20.2 `bench` — what the pair can serve
+### 20.3 `bench` — what the pair can serve
 
 Closed-loop ladder, streaming, ~128 prompt tokens in / 128 out, **cache-busted
 prompts** (prefix caching is on, so a repeated prompt measures the cache, not the
