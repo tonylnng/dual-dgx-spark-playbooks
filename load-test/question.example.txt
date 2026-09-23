@@ -1,0 +1,12 @@
+You are benchmarking a 135 GB NVFP4 Mixture-of-Experts model served by vLLM with
+tensor parallelism 2 across two GB10 nodes over RoCE v2. Each rank keeps 65.0 GiB of
+weights resident in unified memory and the KV pool is sized to about 1.47 million
+tokens at a 262,144-token context.
+
+Given that shape, answer in three short paragraphs: (1) which single resource --
+disk bandwidth, NVLink-equivalent all-reduce, or KV cache capacity -- most often
+caps decode throughput for one long request, and how would you prove it from
+vLLM's own /metrics counters rather than from intuition; (2) what does it mean when
+client-side time-to-first-token rises while vllm:num_preemptions_total stays at
+zero; and (3) why does raising gpu_memory_utilization past 0.80 on unified memory
+change the failure mode from slow to fatal?
